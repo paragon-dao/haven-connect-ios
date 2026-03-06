@@ -39,6 +39,11 @@ final class BLEManagerTests: XCTestCase {
         XCTAssertNotNil(manager.delegate)
     }
 
+    func testBLEManagerConnectedDeviceIdsStartsEmpty() {
+        let manager = BLEManager()
+        XCTAssertTrue(manager.connectedDeviceIds.isEmpty)
+    }
+
     // MARK: - PeripheralDelegate
 
     func testPeripheralDelegateStoresDeviceId() {
@@ -64,6 +69,8 @@ final class BLEManagerTests: XCTestCase {
         XCTAssertTrue(vm.isSecure)
         XCTAssertNil(vm.connectedDeviceName)
         XCTAssertFalse(vm.navigationRequested)
+        XCTAssertTrue(vm.connectedDevices.isEmpty)
+        XCTAssertNil(vm.disconnectRequested)
     }
 
     func testViewModelNavigateSetsFlag() {
@@ -72,11 +79,70 @@ final class BLEManagerTests: XCTestCase {
         XCTAssertTrue(vm.navigationRequested)
     }
 
-    func testViewModelDisconnectClearsName() {
+    // MARK: - Multi-Peripheral Management
+
+    func testViewModelAddConnectedDevice() {
         let vm = BrowserViewModel()
-        vm.connectedDeviceName = "Polar H10"
-        vm.disconnectDevice()
+        vm.addConnectedDevice(id: "device-1", name: "Polar H10")
+        XCTAssertEqual(vm.connectedDevices.count, 1)
+        XCTAssertEqual(vm.connectedDevices[0].id, "device-1")
+        XCTAssertEqual(vm.connectedDevices[0].name, "Polar H10")
+    }
+
+    func testViewModelAddMultipleDevices() {
+        let vm = BrowserViewModel()
+        vm.addConnectedDevice(id: "device-1", name: "Polar H10")
+        vm.addConnectedDevice(id: "device-2", name: "Muse S")
+        XCTAssertEqual(vm.connectedDevices.count, 2)
+    }
+
+    func testViewModelNoDuplicateDevices() {
+        let vm = BrowserViewModel()
+        vm.addConnectedDevice(id: "device-1", name: "Polar H10")
+        vm.addConnectedDevice(id: "device-1", name: "Polar H10")
+        XCTAssertEqual(vm.connectedDevices.count, 1, "Should not add duplicate device")
+    }
+
+    func testViewModelRemoveConnectedDevice() {
+        let vm = BrowserViewModel()
+        vm.addConnectedDevice(id: "device-1", name: "Polar H10")
+        vm.addConnectedDevice(id: "device-2", name: "Muse S")
+        vm.removeConnectedDevice(id: "device-1")
+        XCTAssertEqual(vm.connectedDevices.count, 1)
+        XCTAssertEqual(vm.connectedDevices[0].id, "device-2")
+    }
+
+    func testViewModelRemoveNonexistentDeviceIsNoOp() {
+        let vm = BrowserViewModel()
+        vm.addConnectedDevice(id: "device-1", name: "Polar H10")
+        vm.removeConnectedDevice(id: "nonexistent")
+        XCTAssertEqual(vm.connectedDevices.count, 1)
+    }
+
+    func testViewModelConnectedDeviceNameReturnsFirst() {
+        let vm = BrowserViewModel()
+        vm.addConnectedDevice(id: "device-1", name: "Polar H10")
+        vm.addConnectedDevice(id: "device-2", name: "Muse S")
+        XCTAssertEqual(vm.connectedDeviceName, "Polar H10")
+    }
+
+    func testViewModelConnectedDeviceNameNilWhenEmpty() {
+        let vm = BrowserViewModel()
         XCTAssertNil(vm.connectedDeviceName)
+    }
+
+    func testViewModelRequestDisconnect() {
+        let vm = BrowserViewModel()
+        vm.requestDisconnect(deviceId: "device-1")
+        XCTAssertEqual(vm.disconnectRequested, "device-1")
+    }
+
+    // MARK: - ConnectedDevice
+
+    func testConnectedDeviceIdentifiable() {
+        let d1 = ConnectedDevice(id: "abc", name: "Test")
+        let d2 = ConnectedDevice(id: "abc", name: "Different Name")
+        XCTAssertEqual(d1.id, d2.id)
     }
 }
 
@@ -88,6 +154,7 @@ class MockBLEManagerDelegate: BLEManagerDelegate {
     var disconnectedDeviceIds: [String] = []
     var receivedErrors: [String] = []
     var receivedData: [(Data, String, String)] = []
+    var servicesReadyDeviceIds: [String] = []
 
     func bleManager(_ manager: BLEManager, didDiscoverDevice device: BLEDevice) {
         discoveredDevices.append(device)
@@ -107,6 +174,10 @@ class MockBLEManagerDelegate: BLEManagerDelegate {
 
     func bleManager(_ manager: BLEManager, didReadValue data: Data, characteristicUUID: String, deviceId: String) {
         receivedData.append((data, characteristicUUID, deviceId))
+    }
+
+    func bleManager(_ manager: BLEManager, didServicesReady deviceId: String) {
+        servicesReadyDeviceIds.append(deviceId)
     }
 
     func bleManager(_ manager: BLEManager, didError error: String) {

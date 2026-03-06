@@ -45,6 +45,12 @@ struct WebViewRepresentable: UIViewRepresentable {
     }
 
     func updateUIView(_ webView: WKWebView, context: Context) {
+        // Handle disconnect requests from the UI
+        if let deviceId = viewModel.disconnectRequested {
+            viewModel.disconnectRequested = nil
+            context.coordinator.bleManager.disconnect(deviceId: deviceId)
+        }
+
         // Only navigate when the user explicitly submitted a new URL.
         // This prevents loops: didFinish updates urlText -> updateUIView fires -> re-navigates.
         guard viewModel.navigationRequested else { return }
@@ -202,7 +208,7 @@ extension WebViewRepresentable.Coordinator: BLEManagerDelegate {
     func bleManager(_ manager: BLEManager, didConnect deviceId: String, name: String?) {
         let js = "window.__havenBLE.onConnected(\(escapeJS(deviceId)));"
         DispatchQueue.main.async {
-            self.viewModel.connectedDeviceName = name ?? deviceId
+            self.viewModel.addConnectedDevice(id: deviceId, name: name ?? deviceId)
             self.webView?.evaluateJavaScript(js)
         }
     }
@@ -210,7 +216,14 @@ extension WebViewRepresentable.Coordinator: BLEManagerDelegate {
     func bleManager(_ manager: BLEManager, didDisconnect deviceId: String) {
         let js = "window.__havenBLE.onDisconnected(\(escapeJS(deviceId)));"
         DispatchQueue.main.async {
-            self.viewModel.connectedDeviceName = nil
+            self.viewModel.removeConnectedDevice(id: deviceId)
+            self.webView?.evaluateJavaScript(js)
+        }
+    }
+
+    func bleManager(_ manager: BLEManager, didServicesReady deviceId: String) {
+        let js = "window.__havenBLE.onServicesReady(\(escapeJS(deviceId)));"
+        DispatchQueue.main.async {
             self.webView?.evaluateJavaScript(js)
         }
     }

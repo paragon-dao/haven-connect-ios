@@ -16,6 +16,7 @@ protocol BLEManagerDelegate: AnyObject {
     func bleManager(_ manager: BLEManager, didDisconnect deviceId: String)
     func bleManager(_ manager: BLEManager, didReceiveData data: Data, characteristicUUID: String, deviceId: String)
     func bleManager(_ manager: BLEManager, didReadValue data: Data, characteristicUUID: String, deviceId: String)
+    func bleManager(_ manager: BLEManager, didServicesReady deviceId: String)
     func bleManager(_ manager: BLEManager, didError error: String)
 }
 
@@ -82,6 +83,17 @@ class BLEManager: NSObject {
             return
         }
         centralManager.connect(peripheral, options: nil)
+
+        // CoreBluetooth has no built-in connection timeout — it will try forever.
+        // Cancel after 15 seconds if not connected.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [weak self] in
+            guard let self = self else { return }
+            if self.connectedPeripherals[deviceId] == nil,
+               let p = self.discoveredPeripherals[deviceId] {
+                self.centralManager.cancelPeripheralConnection(p)
+                self.delegate?.bleManager(self, didError: "Connection timed out")
+            }
+        }
     }
 
     func disconnect(deviceId: String) {
@@ -119,6 +131,16 @@ class BLEManager: NSObject {
             return
         }
         pd.writeCharacteristic(serviceUUID: serviceUUID, characteristicUUID: characteristicUUID, value: value)
+    }
+
+    func disconnectAll() {
+        for (_, peripheral) in connectedPeripherals {
+            centralManager.cancelPeripheralConnection(peripheral)
+        }
+    }
+
+    var connectedDeviceIds: [String] {
+        Array(connectedPeripherals.keys)
     }
 }
 
@@ -178,6 +200,7 @@ class PeripheralDelegate: NSObject, CBPeripheralDelegate {
     weak var manager: BLEManager?
     let deviceId: String
     private var characteristics: [String: CBCharacteristic] = [:]
+    private var pendingServiceCount: Int = 0
 
     init(manager: BLEManager, deviceId: String) {
         self.manager = manager
@@ -185,17 +208,28 @@ class PeripheralDelegate: NSObject, CBPeripheralDelegate {
     }
 
     func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
-        guard let services = peripheral.services else { return }
+        guard let services = peripheral.services, !services.isEmpty else {
+            guard let manager = manager else { return }
+            manager.delegate?.bleManager(manager, didServicesReady: deviceId)
+            return
+        }
+        pendingServiceCount = services.count
         for service in services {
             peripheral.discoverCharacteristics(nil, for: service)
         }
     }
 
     func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
-        guard let chars = service.characteristics else { return }
-        for char in chars {
-            let key = "\(service.uuid.uuidString.lowercased()):\(char.uuid.uuidString.lowercased())"
-            characteristics[key] = char
+        if let chars = service.characteristics {
+            for char in chars {
+                let key = "\(service.uuid.uuidString.lowercased()):\(char.uuid.uuidString.lowercased())"
+                characteristics[key] = char
+            }
+        }
+        pendingServiceCount -= 1
+        if pendingServiceCount <= 0 {
+            guard let manager = manager else { return }
+            manager.delegate?.bleManager(manager, didServicesReady: deviceId)
         }
     }
 
@@ -203,7 +237,8 @@ class PeripheralDelegate: NSObject, CBPeripheralDelegate {
         let key = "\(serviceUUID.lowercased()):\(characteristicUUID.lowercased())"
         guard let char = characteristics[key],
               let peripheral = char.service?.peripheral else {
-            manager?.delegate?.bleManager(manager!, didError: "Characteristic not found: \(characteristicUUID)")
+            guard let manager = manager else { return }
+            manager.delegate?.bleManager(manager, didError: "Characteristic not found: \(characteristicUUID)")
             return
         }
         peripheral.readValue(for: char)
@@ -213,7 +248,8 @@ class PeripheralDelegate: NSObject, CBPeripheralDelegate {
         let key = "\(serviceUUID.lowercased()):\(characteristicUUID.lowercased())"
         guard let char = characteristics[key],
               let peripheral = char.service?.peripheral else {
-            manager?.delegate?.bleManager(manager!, didError: "Characteristic not found: \(characteristicUUID)")
+            guard let manager = manager else { return }
+            manager.delegate?.bleManager(manager, didError: "Characteristic not found: \(characteristicUUID)")
             return
         }
         peripheral.setNotifyValue(enabled, for: char)
@@ -223,7 +259,8 @@ class PeripheralDelegate: NSObject, CBPeripheralDelegate {
         let key = "\(serviceUUID.lowercased()):\(characteristicUUID.lowercased())"
         guard let char = characteristics[key],
               let peripheral = char.service?.peripheral else {
-            manager?.delegate?.bleManager(manager!, didError: "Characteristic not found: \(characteristicUUID)")
+            guard let manager = manager else { return }
+            manager.delegate?.bleManager(manager, didError: "Characteristic not found: \(characteristicUUID)")
             return
         }
         let type: CBCharacteristicWriteType = char.properties.contains(.writeWithoutResponse)

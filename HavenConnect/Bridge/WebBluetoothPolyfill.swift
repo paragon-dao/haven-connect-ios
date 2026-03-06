@@ -17,57 +17,109 @@ enum WebBluetoothPolyfill {
         // Don't inject if Web Bluetooth is already natively supported
         if (navigator.bluetooth) return;
 
-        const pendingRequests = new Map();
-        let requestId = 0;
-        const devices = {};
-        const gattServers = {};
-        const notifyCallbacks = {};
+        var REQUEST_TIMEOUT_MS = 30000;
+        var pendingRequests = new Map();
+        var requestId = 0;
+        var devices = {};
+        var gattServers = {};
+        var notifyCallbacks = {};
+        var servicesReady = {};
+
+        function timeoutRequest(id, label) {
+            return setTimeout(function() {
+                var pending = pendingRequests.get(id);
+                if (pending) {
+                    pendingRequests.delete(id);
+                    pending.reject(new DOMException(
+                        label + ' timed out after ' + REQUEST_TIMEOUT_MS + 'ms',
+                        'TimeoutError'
+                    ));
+                }
+            }, REQUEST_TIMEOUT_MS);
+        }
+
+        function addPending(type, extra) {
+            return new Promise(function(resolve, reject) {
+                var id = ++requestId;
+                var entry = Object.assign({ id: id, type: type, resolve: resolve, reject: reject }, extra || {});
+                pendingRequests.set(id, entry);
+                entry._timer = timeoutRequest(id, type);
+                return id;
+            });
+        }
+
+        function resolvePending(predicate) {
+            for (var entry of pendingRequests) {
+                var id = entry[0], pending = entry[1];
+                if (predicate(pending)) {
+                    clearTimeout(pending._timer);
+                    pendingRequests.delete(id);
+                    return pending;
+                }
+            }
+            return null;
+        }
 
         // Internal bridge object
         window.__havenBLE = {
             onDeviceDiscovered: function(device) {
                 if (typeof device.id !== 'string') return;
                 devices[device.id] = device;
-                // Resolve the oldest pending requestDevice call
-                for (const [id, pending] of pendingRequests) {
-                    if (pending.type === 'requestDevice') {
-                        pendingRequests.delete(id);
-                        pending.resolve(createBluetoothDevice(device));
-                        return;
-                    }
-                }
+                var pending = resolvePending(function(p) { return p.type === 'requestDevice'; });
+                if (pending) pending.resolve(createBluetoothDevice(device));
             },
             onConnected: function(deviceId) {
                 if (typeof deviceId !== 'string') return;
-                for (const [id, pending] of pendingRequests) {
-                    if (pending.type === 'connect' && pending.deviceId === deviceId) {
-                        pendingRequests.delete(id);
-                        const server = createGATTServer(deviceId);
-                        gattServers[deviceId] = server;
-                        pending.resolve(server);
-                        return;
-                    }
+                var pending = resolvePending(function(p) {
+                    return p.type === 'connect' && p.deviceId === deviceId;
+                });
+                if (pending) {
+                    var server = createGATTServer(deviceId);
+                    gattServers[deviceId] = server;
+                    pending.resolve(server);
                 }
             },
             onDisconnected: function(deviceId) {
                 if (typeof deviceId !== 'string') return;
-                const server = gattServers[deviceId];
+                servicesReady[deviceId] = false;
+                var server = gattServers[deviceId];
                 if (server) server.connected = false;
-                const device = devices[deviceId];
+                var device = devices[deviceId];
                 if (device && device._eventTarget) {
                     device._eventTarget.dispatchEvent(new Event('gattserverdisconnected'));
+                }
+                // Reject any pending requests for this device
+                for (var entry of pendingRequests) {
+                    var id = entry[0], pending = entry[1];
+                    if (pending.deviceId === deviceId) {
+                        clearTimeout(pending._timer);
+                        pendingRequests.delete(id);
+                        pending.reject(new DOMException('Device disconnected', 'NetworkError'));
+                    }
+                }
+            },
+            onServicesReady: function(deviceId) {
+                if (typeof deviceId !== 'string') return;
+                servicesReady[deviceId] = true;
+                // Resolve any pending getPrimaryService calls
+                for (var entry of pendingRequests) {
+                    var id = entry[0], pending = entry[1];
+                    if (pending.type === 'getPrimaryService' && pending.deviceId === deviceId) {
+                        clearTimeout(pending._timer);
+                        pendingRequests.delete(id);
+                        pending.resolve(createService(deviceId, pending.serviceUUID));
+                    }
                 }
             },
             onCharacteristicValueChanged: function(deviceId, charUUID, value) {
                 if (typeof charUUID !== 'string') return;
                 var key = charUUID.toLowerCase();
                 // Resolve any pending read for this device + characteristic
-                for (const [id, pending] of pendingRequests) {
-                    if (pending.type === 'read' && pending.charUUID.toLowerCase() === key && pending.deviceId === deviceId) {
-                        pendingRequests.delete(id);
-                        pending.resolve(new DataView(value.buffer));
-                        break;
-                    }
+                var pending = resolvePending(function(p) {
+                    return p.type === 'read' && p.charUUID.toLowerCase() === key && p.deviceId === deviceId;
+                });
+                if (pending) {
+                    pending.resolve(new DataView(value.buffer));
                 }
                 // Fire notification callbacks
                 var callbackKey = deviceId + ':' + key;
@@ -79,13 +131,23 @@ enum WebBluetoothPolyfill {
             },
             onError: function(error) {
                 if (typeof error !== 'string') return;
-                // Reject the oldest pending request
-                for (const [id, pending] of pendingRequests) {
-                    pendingRequests.delete(id);
-                    pending.reject(new DOMException(error, 'NetworkError'));
-                    return;
+                // Try to match error to the right pending request type
+                var pending = null;
+                if (error.indexOf('connect') !== -1 || error.indexOf('Connection') !== -1) {
+                    pending = resolvePending(function(p) { return p.type === 'connect'; });
                 }
-                console.error('[Haven Connect] BLE error with no pending request:', error);
+                if (!pending && error.indexOf('Characteristic') !== -1) {
+                    pending = resolvePending(function(p) { return p.type === 'read' || p.type === 'write'; });
+                }
+                // Fallback: reject the oldest pending request
+                if (!pending) {
+                    pending = resolvePending(function() { return true; });
+                }
+                if (pending) {
+                    pending.reject(new DOMException(error, 'NetworkError'));
+                } else {
+                    console.error('[Haven Connect] BLE error with no pending request:', error);
+                }
             }
         };
 
@@ -109,7 +171,9 @@ enum WebBluetoothPolyfill {
                     connect: function() {
                         return new Promise(function(resolve, reject) {
                             var id = ++requestId;
-                            pendingRequests.set(id, { id: id, type: 'connect', deviceId: info.id, resolve: resolve, reject: reject });
+                            var entry = { id: id, type: 'connect', deviceId: info.id, resolve: resolve, reject: reject };
+                            pendingRequests.set(id, entry);
+                            entry._timer = timeoutRequest(id, 'connect');
                             sendToNative('connect', { deviceId: info.id });
                         });
                     },
@@ -134,7 +198,19 @@ enum WebBluetoothPolyfill {
                     sendToNative('disconnect', { deviceId: deviceId });
                 },
                 getPrimaryService: function(serviceUUID) {
-                    return Promise.resolve(createService(deviceId, serviceUUID));
+                    // Wait for service discovery to complete before resolving
+                    if (servicesReady[deviceId]) {
+                        return Promise.resolve(createService(deviceId, serviceUUID));
+                    }
+                    return new Promise(function(resolve, reject) {
+                        var id = ++requestId;
+                        var entry = {
+                            id: id, type: 'getPrimaryService', deviceId: deviceId,
+                            serviceUUID: serviceUUID, resolve: resolve, reject: reject
+                        };
+                        pendingRequests.set(id, entry);
+                        entry._timer = timeoutRequest(id, 'getPrimaryService');
+                    });
                 },
                 getPrimaryServices: function() {
                     return Promise.resolve([]);
@@ -165,7 +241,12 @@ enum WebBluetoothPolyfill {
                 readValue: function() {
                     return new Promise(function(resolve, reject) {
                         var id = ++requestId;
-                        pendingRequests.set(id, { id: id, type: 'read', deviceId: deviceId, charUUID: charUUID, resolve: resolve, reject: reject });
+                        var entry = {
+                            id: id, type: 'read', deviceId: deviceId,
+                            charUUID: charUUID, resolve: resolve, reject: reject
+                        };
+                        pendingRequests.set(id, entry);
+                        entry._timer = timeoutRequest(id, 'readValue');
                         sendToNative('readCharacteristic', {
                             deviceId: deviceId,
                             serviceUUID: serviceUUID,
@@ -229,7 +310,9 @@ enum WebBluetoothPolyfill {
             requestDevice: function(options) {
                 return new Promise(function(resolve, reject) {
                     var id = ++requestId;
-                    pendingRequests.set(id, { id: id, type: 'requestDevice', resolve: resolve, reject: reject });
+                    var entry = { id: id, type: 'requestDevice', resolve: resolve, reject: reject };
+                    pendingRequests.set(id, entry);
+                    entry._timer = timeoutRequest(id, 'requestDevice');
                     sendToNative('requestDevice', {
                         filters: options && options.filters ? options.filters : null
                     });

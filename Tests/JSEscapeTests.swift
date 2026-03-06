@@ -43,21 +43,36 @@ final class JSEscapeTests: XCTestCase {
     func testEscapesSingleQuoteInjection() {
         let malicious = "'; alert('xss'); '"
         let result = escapeJS(malicious)
-        XCTAssertFalse(result.contains("'; alert"), "Single quote injection must be escaped")
+        // All single quotes must be preceded by a backslash in the output
+        // Input: '; alert('xss'); '  → Output: '\'; alert(\'xss\'); \''
+        // The key is that every ' inside the wrapper quotes is escaped as \'
         XCTAssertTrue(result.contains("\\'"), "Single quotes must be backslash-escaped")
+        // Verify no unescaped single quote exists inside the wrapper (between first and last ')
+        let inner = String(result.dropFirst().dropLast())
+        let unescapedQuotes = inner.replacingOccurrences(of: "\\'", with: "").contains("'")
+        XCTAssertFalse(unescapedQuotes, "No unescaped single quotes should exist inside the string")
     }
 
     func testEscapesDoubleQuoteInjection() {
         let malicious = "\"; alert(\"xss\"); \""
         let result = escapeJS(malicious)
-        XCTAssertFalse(result.contains("\"; alert"), "Double quote injection must be escaped")
+        // All double quotes must be escaped as \"
+        XCTAssertTrue(result.contains("\\\""), "Double quotes must be backslash-escaped")
+        let inner = String(result.dropFirst().dropLast())
+        let unescapedDoubles = inner.replacingOccurrences(of: "\\\"", with: "").contains("\"")
+        XCTAssertFalse(unescapedDoubles, "No unescaped double quotes should exist inside the string")
     }
 
     func testEscapesBackslashInjection() {
         let malicious = "\\'; alert('xss'); //'"
         let result = escapeJS(malicious)
-        // The backslash must be escaped first, so \\' becomes \\\\\'
-        XCTAssertFalse(result.contains("\\'; alert"), "Backslash+quote injection must be escaped")
+        // The backslash must be escaped first: \ becomes \\, then ' becomes \'
+        // So \' in input becomes \\' which is escaped-backslash + escaped-quote = \\\\'
+        XCTAssertTrue(result.contains("\\\\"), "Backslashes must be escaped")
+        let inner = String(result.dropFirst().dropLast())
+        // Remove all escaped sequences to check for unescaped quotes
+        let cleaned = inner.replacingOccurrences(of: "\\\\", with: "").replacingOccurrences(of: "\\'", with: "")
+        XCTAssertFalse(cleaned.contains("'"), "No unescaped quotes after backslash escaping")
     }
 
     func testEscapesNewlineInjection() {

@@ -92,13 +92,10 @@ final class WebBluetoothPolyfillTests: XCTestCase {
     }
 
     func testPolyfillPassesDeviceIdInAllActions() {
-        // All BLE operations must include deviceId to target the correct peripheral
         let actions = ["readCharacteristic", "writeCharacteristic", "startNotifications", "stopNotifications"]
         for action in actions {
-            // Find the sendToNative call for this action and verify deviceId is included
             XCTAssertTrue(js.contains("sendToNative('\(action)'"), "Must send \(action) to native")
         }
-        // Verify deviceId is passed in characteristic operations
         let deviceIdOccurrences = js.components(separatedBy: "deviceId: deviceId").count - 1
         XCTAssertGreaterThanOrEqual(deviceIdOccurrences, 6, "deviceId must be passed in connect, disconnect, read, write, startNotify, stopNotify")
     }
@@ -114,13 +111,11 @@ final class WebBluetoothPolyfillTests: XCTestCase {
     }
 
     func testPolyfillHandlesArrayBufferAndDataView() {
-        // writeValue must handle both ArrayBuffer and DataView (BufferSource per spec)
         XCTAssertTrue(js.contains("value instanceof ArrayBuffer"), "Must handle ArrayBuffer input to writeValue")
         XCTAssertTrue(js.contains("value.buffer"), "Must handle DataView input to writeValue")
     }
 
     func testPolyfillUsesMapForPendingRequests() {
-        // Map provides proper iteration order (insertion order) and O(1) delete
         XCTAssertTrue(js.contains("new Map()"), "Must use Map for pending requests, not plain object")
     }
 
@@ -130,5 +125,55 @@ final class WebBluetoothPolyfillTests: XCTestCase {
 
     func testPolyfillWrapsNativeBridgeInTryCatch() {
         XCTAssertTrue(js.contains("try {") && js.contains("window.webkit.messageHandlers"), "Must wrap native bridge calls in try-catch")
+    }
+
+    // MARK: - Promise Timeout
+
+    func testPolyfillDefinesRequestTimeout() {
+        XCTAssertTrue(js.contains("REQUEST_TIMEOUT_MS"), "Must define a request timeout constant")
+    }
+
+    func testPolyfillTimesOutPendingRequests() {
+        XCTAssertTrue(js.contains("setTimeout"), "Must use setTimeout for request timeouts")
+        XCTAssertTrue(js.contains("TimeoutError"), "Must use TimeoutError DOMException for timeouts")
+    }
+
+    func testPolyfillClearsTimeoutOnResolve() {
+        XCTAssertTrue(js.contains("clearTimeout"), "Must clear timeout when request resolves")
+    }
+
+    // MARK: - Service Discovery Gating
+
+    func testPolyfillTracksServicesReady() {
+        XCTAssertTrue(js.contains("servicesReady"), "Must track service discovery completion state")
+    }
+
+    func testPolyfillImplementsOnServicesReady() {
+        XCTAssertTrue(js.contains("onServicesReady"), "Must handle onServicesReady callback from native")
+    }
+
+    func testPolyfillGatesPrimaryServiceOnDiscovery() {
+        // getPrimaryService should wait for services to be discovered
+        XCTAssertTrue(js.contains("servicesReady[deviceId]"), "getPrimaryService must check if services are ready")
+        XCTAssertTrue(js.contains("type: 'getPrimaryService'"), "Must queue getPrimaryService as pending if not ready")
+    }
+
+    // MARK: - Error Recovery
+
+    func testPolyfillRejectsPendingOnDisconnect() {
+        // When a device disconnects, all pending requests for that device should be rejected
+        XCTAssertTrue(js.contains("Device disconnected"), "Must reject pending requests on disconnect with clear message")
+    }
+
+    func testPolyfillRoutesErrorsByType() {
+        // Error routing should attempt to match errors to the right request type
+        XCTAssertTrue(js.contains("error.indexOf('connect')") || js.contains("error.indexOf('Connection')"),
+                       "Must attempt to route connection errors to connect requests")
+        XCTAssertTrue(js.contains("error.indexOf('Characteristic')"),
+                       "Must attempt to route characteristic errors to read/write requests")
+    }
+
+    func testPolyfillClearsServicesReadyOnDisconnect() {
+        XCTAssertTrue(js.contains("servicesReady[deviceId] = false"), "Must clear servicesReady on disconnect")
     }
 }
