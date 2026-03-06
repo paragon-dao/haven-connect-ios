@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>NSBluetoothAlwaysUsageDescription</key>
+    <string>Haven Connect uses Bluetooth to communicate with health monitoring devices like EEG headbands, heart rate monitors, and pulse oximeters.</string>
+    <key>NSBluetoothPeripheralUsageDescription</key>
+    <string>Haven Connect uses Bluetooth to communicate with health monitoring devices.</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Haven Connect uses the microphone for breathing analysis in health applications.</string>
+    <key>NSCameraUsageDescription</key>
+    <string>Haven Connect uses the camera for heart rate detection via photoplethysmography (PPG) in health applications.</string>
+    <key>NSLocationWhenInUseUsageDescription</key>
+    <string>Location permission is required by iOS for Bluetooth device discovery. Haven Connect does not track your location.</string>
+</dict>
+</plist>
