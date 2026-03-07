@@ -60,89 +60,131 @@ final class BLEManagerTests: XCTestCase {
         XCTAssertNil(pd.manager)
     }
 
-    // MARK: - BrowserViewModel
+    // MARK: - DeviceManager
 
-    func testViewModelDefaultState() {
-        let vm = BrowserViewModel()
-        XCTAssertEqual(vm.urlText, "https://paragondao.org")
-        XCTAssertFalse(vm.isLoading)
-        XCTAssertTrue(vm.isSecure)
-        XCTAssertNil(vm.connectedDeviceName)
-        XCTAssertFalse(vm.navigationRequested)
-        XCTAssertTrue(vm.connectedDevices.isEmpty)
-        XCTAssertNil(vm.disconnectRequested)
+    func testDeviceManagerStartsEmpty() {
+        let dm = DeviceManager()
+        XCTAssertTrue(dm.connectedDevices.isEmpty)
     }
 
-    func testViewModelNavigateSetsFlag() {
-        let vm = BrowserViewModel()
-        vm.navigate()
-        XCTAssertTrue(vm.navigationRequested)
+    func testDeviceManagerAddDevice() {
+        let dm = DeviceManager()
+        dm.addDevice(id: "device-1", name: "Polar H10")
+        XCTAssertEqual(dm.connectedDevices.count, 1)
+        XCTAssertEqual(dm.connectedDevices[0].id, "device-1")
+        XCTAssertEqual(dm.connectedDevices[0].name, "Polar H10")
     }
 
-    // MARK: - Multi-Peripheral Management
-
-    func testViewModelAddConnectedDevice() {
-        let vm = BrowserViewModel()
-        vm.addConnectedDevice(id: "device-1", name: "Polar H10")
-        XCTAssertEqual(vm.connectedDevices.count, 1)
-        XCTAssertEqual(vm.connectedDevices[0].id, "device-1")
-        XCTAssertEqual(vm.connectedDevices[0].name, "Polar H10")
+    func testDeviceManagerAddMultipleDevices() {
+        let dm = DeviceManager()
+        dm.addDevice(id: "device-1", name: "Polar H10")
+        dm.addDevice(id: "device-2", name: "Muse S")
+        XCTAssertEqual(dm.connectedDevices.count, 2)
     }
 
-    func testViewModelAddMultipleDevices() {
-        let vm = BrowserViewModel()
-        vm.addConnectedDevice(id: "device-1", name: "Polar H10")
-        vm.addConnectedDevice(id: "device-2", name: "Muse S")
-        XCTAssertEqual(vm.connectedDevices.count, 2)
+    func testDeviceManagerNoDuplicateDevices() {
+        let dm = DeviceManager()
+        dm.addDevice(id: "device-1", name: "Polar H10")
+        dm.addDevice(id: "device-1", name: "Polar H10")
+        XCTAssertEqual(dm.connectedDevices.count, 1, "Should not add duplicate device")
     }
 
-    func testViewModelNoDuplicateDevices() {
-        let vm = BrowserViewModel()
-        vm.addConnectedDevice(id: "device-1", name: "Polar H10")
-        vm.addConnectedDevice(id: "device-1", name: "Polar H10")
-        XCTAssertEqual(vm.connectedDevices.count, 1, "Should not add duplicate device")
+    func testDeviceManagerRemoveDevice() {
+        let dm = DeviceManager()
+        dm.addDevice(id: "device-1", name: "Polar H10")
+        dm.addDevice(id: "device-2", name: "Muse S")
+        dm.removeDevice(id: "device-1")
+        XCTAssertEqual(dm.connectedDevices.count, 1)
+        XCTAssertEqual(dm.connectedDevices[0].id, "device-2")
     }
 
-    func testViewModelRemoveConnectedDevice() {
-        let vm = BrowserViewModel()
-        vm.addConnectedDevice(id: "device-1", name: "Polar H10")
-        vm.addConnectedDevice(id: "device-2", name: "Muse S")
-        vm.removeConnectedDevice(id: "device-1")
-        XCTAssertEqual(vm.connectedDevices.count, 1)
-        XCTAssertEqual(vm.connectedDevices[0].id, "device-2")
+    func testDeviceManagerRemoveNonexistentDeviceIsNoOp() {
+        let dm = DeviceManager()
+        dm.addDevice(id: "device-1", name: "Polar H10")
+        dm.removeDevice(id: "nonexistent")
+        XCTAssertEqual(dm.connectedDevices.count, 1)
     }
 
-    func testViewModelRemoveNonexistentDeviceIsNoOp() {
-        let vm = BrowserViewModel()
-        vm.addConnectedDevice(id: "device-1", name: "Polar H10")
-        vm.removeConnectedDevice(id: "nonexistent")
-        XCTAssertEqual(vm.connectedDevices.count, 1)
+    func testDeviceManagerDisconnectCallback() {
+        let dm = DeviceManager()
+        var disconnectedId: String?
+        dm.onDisconnectRequest = { id in disconnectedId = id }
+        dm.requestDisconnect(deviceId: "device-1")
+        XCTAssertEqual(disconnectedId, "device-1")
     }
 
-    func testViewModelConnectedDeviceNameReturnsFirst() {
-        let vm = BrowserViewModel()
-        vm.addConnectedDevice(id: "device-1", name: "Polar H10")
-        vm.addConnectedDevice(id: "device-2", name: "Muse S")
-        XCTAssertEqual(vm.connectedDeviceName, "Polar H10")
-    }
+    // MARK: - ManagedDevice
 
-    func testViewModelConnectedDeviceNameNilWhenEmpty() {
-        let vm = BrowserViewModel()
-        XCTAssertNil(vm.connectedDeviceName)
-    }
-
-    func testViewModelRequestDisconnect() {
-        let vm = BrowserViewModel()
-        vm.requestDisconnect(deviceId: "device-1")
-        XCTAssertEqual(vm.disconnectRequested, "device-1")
-    }
-
-    // MARK: - ConnectedDevice
-
-    func testConnectedDeviceIdentifiable() {
-        let d1 = ConnectedDevice(id: "abc", name: "Test")
-        let d2 = ConnectedDevice(id: "abc", name: "Different Name")
+    func testManagedDeviceIdentifiable() {
+        let d1 = ManagedDevice(id: "abc", name: "Test")
+        let d2 = ManagedDevice(id: "abc", name: "Different Name")
         XCTAssertEqual(d1.id, d2.id)
+    }
+
+    // MARK: - AppRegistry
+
+    func testAppRegistryHasApps() {
+        XCTAssertGreaterThanOrEqual(AppRegistry.apps.count, 3, "Must have at least 3 apps for App Store review")
+    }
+
+    func testAppRegistryAllowsRegisteredHosts() {
+        for app in AppRegistry.apps {
+            let url = URL(string: app.url)!
+            XCTAssertTrue(AppRegistry.isAllowed(url), "\(app.name) URL must be allowed")
+        }
+    }
+
+    func testAppRegistryBlocksUnknownHosts() {
+        let evil = URL(string: "https://evil.com/steal-data")!
+        XCTAssertFalse(AppRegistry.isAllowed(evil), "Unknown hosts must be blocked")
+    }
+
+    func testAppRegistryBlocksGoogleDotCom() {
+        let google = URL(string: "https://google.com")!
+        XCTAssertFalse(AppRegistry.isAllowed(google), "google.com must be blocked")
+    }
+
+    // MARK: - GATT Profiles
+
+    func testParseHeartRate8Bit() {
+        // Flags: 0x00 (8-bit HR), HR: 72 bpm
+        let data = Data([0x00, 72])
+        let reading = GATTProfiles.parseHeartRate(data: data)
+        XCTAssertNotNil(reading)
+        XCTAssertEqual(reading?.bpm, 72)
+    }
+
+    func testParseHeartRate16Bit() {
+        // Flags: 0x01 (16-bit HR), HR: 300 bpm (little-endian: 0x2C, 0x01)
+        let data = Data([0x01, 0x2C, 0x01])
+        let reading = GATTProfiles.parseHeartRate(data: data)
+        XCTAssertNotNil(reading)
+        XCTAssertEqual(reading?.bpm, 300)
+    }
+
+    func testParseHeartRateTooShort() {
+        let data = Data([0x00])
+        XCTAssertNil(GATTProfiles.parseHeartRate(data: data))
+    }
+
+    func testParseBatteryLevel() {
+        let data = Data([85])
+        XCTAssertEqual(GATTProfiles.parseBatteryLevel(data: data), 85)
+    }
+
+    func testIdentifyHeartRateCharacteristic() {
+        let type = GATTProfiles.identifyCharacteristic(serviceUUID: "180D", characteristicUUID: "2A37")
+        XCTAssertEqual(type, .heartRate)
+    }
+
+    func testIdentifySpO2Characteristic() {
+        let type = GATTProfiles.identifyCharacteristic(serviceUUID: "1822", characteristicUUID: "2A5E")
+        XCTAssertEqual(type, .spo2)
+    }
+
+    func testIdentifyUnknownCharacteristic() {
+        let type = GATTProfiles.identifyCharacteristic(serviceUUID: "FFFF", characteristicUUID: "FFFF")
+        XCTAssertNil(type)
     }
 }
 

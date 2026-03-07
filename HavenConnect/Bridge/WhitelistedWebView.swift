@@ -1,33 +1,31 @@
 import SwiftUI
 import WebKit
 
-/// WKWebView wrapper that injects the Web Bluetooth polyfill.
+/// WKWebView that only loads whitelisted Paragon network URLs.
 ///
-/// Uses Apple's own WKWebView (WebKit engine) + CoreBluetooth.
-/// The polyfill intercepts navigator.bluetooth calls from web pages
-/// and routes them through the native BLE bridge.
-struct WebViewRepresentable: UIViewRepresentable {
-    @ObservedObject var viewModel: BrowserViewModel
+/// Security model (per panel verdict):
+/// - Polyfill ONLY injected on approved domains (AppRegistry.allowedHosts)
+/// - Navigation to non-whitelisted URLs is blocked
+/// - BLE data from GATT health profiles is automatically written to HealthKit
+struct WhitelistedWebView: UIViewRepresentable {
+    let url: String
+    @ObservedObject var deviceManager: DeviceManager
+    @ObservedObject var healthKit: HealthKitManager
 
     func makeUIView(context: Context) -> WKWebView {
         let config = WKWebViewConfiguration()
 
-        // Inject Web Bluetooth polyfill before page loads
-        let polyfill = WebBluetoothPolyfill.javascript
+        // Inject Web Bluetooth polyfill
         let script = WKUserScript(
-            source: polyfill,
+            source: WebBluetoothPolyfill.javascript,
             injectionTime: .atDocumentStart,
             forMainFrameOnly: true
         )
         config.userContentController.addUserScript(script)
 
-        // Use a weak message handler wrapper to avoid WKUserContentController retain cycle.
-        // WKUserContentController retains its message handlers strongly, which creates a
-        // retain cycle: WKWebView -> config -> contentController -> coordinator -> webView.
         let weakHandler = WeakScriptMessageHandler(delegate: context.coordinator)
         config.userContentController.add(weakHandler, name: "havenBLE")
 
-        // Allow media (microphone for breathing capture)
         config.allowsInlineMediaPlayback = true
         config.mediaTypesRequiringUserActionForPlayback = []
 
@@ -35,9 +33,9 @@ struct WebViewRepresentable: UIViewRepresentable {
         webView.navigationDelegate = context.coordinator
         webView.allowsBackForwardNavigationGestures = true
 
-        // Load default URL
-        if let url = URL(string: viewModel.urlText) {
-            webView.load(URLRequest(url: url))
+        // Load the approved URL
+        if let loadURL = URL(string: url) {
+            webView.load(URLRequest(url: loadURL))
         }
 
         context.coordinator.webView = webView
@@ -45,63 +43,60 @@ struct WebViewRepresentable: UIViewRepresentable {
     }
 
     func updateUIView(_ webView: WKWebView, context: Context) {
-        // Handle disconnect requests from the UI
-        if let deviceId = viewModel.disconnectRequested {
-            viewModel.disconnectRequested = nil
-            context.coordinator.bleManager.disconnect(deviceId: deviceId)
-        }
-
-        // Only navigate when the user explicitly submitted a new URL.
-        // This prevents loops: didFinish updates urlText -> updateUIView fires -> re-navigates.
-        guard viewModel.navigationRequested else { return }
-        viewModel.navigationRequested = false
-
-        var urlString = viewModel.urlText
-        if !urlString.hasPrefix("http://") && !urlString.hasPrefix("https://") {
-            urlString = "https://" + urlString
-        }
-        if let url = URL(string: urlString) {
-            webView.load(URLRequest(url: url))
-        }
+        // No URL bar updates — URL is fixed from the launcher
     }
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(viewModel: viewModel)
+        Coordinator(deviceManager: deviceManager, healthKit: healthKit)
     }
 
     class Coordinator: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
-        var viewModel: BrowserViewModel
+        let deviceManager: DeviceManager
+        let healthKit: HealthKitManager
         var webView: WKWebView?
         let bleManager = BLEManager()
 
-        init(viewModel: BrowserViewModel) {
-            self.viewModel = viewModel
+        // Accumulate RR intervals for HRV calculation
+        private var rrAccumulator: [Double] = []
+        private var lastHRVWrite: Date = .distantPast
+
+        init(deviceManager: DeviceManager, healthKit: HealthKitManager) {
+            self.deviceManager = deviceManager
+            self.healthKit = healthKit
             super.init()
             bleManager.delegate = self
+
+            // Wire up disconnect requests from the Devices tab
+            deviceManager.onDisconnectRequest = { [weak self] deviceId in
+                self?.bleManager.disconnect(deviceId: deviceId)
+            }
         }
 
         // MARK: - WKNavigationDelegate
 
-        func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
-            DispatchQueue.main.async {
-                self.viewModel.isLoading = true
+        /// Block navigation to non-whitelisted URLs.
+        func webView(
+            _ webView: WKWebView,
+            decidePolicyFor navigationAction: WKNavigationAction,
+            decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
+        ) {
+            if let url = navigationAction.request.url {
+                if AppRegistry.isAllowed(url) {
+                    decisionHandler(.allow)
+                } else {
+                    // Open external URLs in Safari instead
+                    if navigationAction.navigationType == .linkActivated {
+                        UIApplication.shared.open(url)
+                    }
+                    decisionHandler(.cancel)
+                }
+            } else {
+                decisionHandler(.cancel)
             }
         }
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-            DispatchQueue.main.async {
-                self.viewModel.isLoading = false
-                if let url = webView.url {
-                    self.viewModel.urlText = url.absoluteString
-                    self.viewModel.isSecure = url.scheme == "https"
-                }
-            }
-        }
-
-        func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
-            DispatchQueue.main.async {
-                self.viewModel.isLoading = false
-            }
+            // No URL bar to update — intentionally empty
         }
 
         // MARK: - WKScriptMessageHandler (BLE Bridge)
@@ -166,6 +161,124 @@ struct WebViewRepresentable: UIViewRepresentable {
                 break
             }
         }
+
+        // MARK: - HealthKit auto-write from BLE data
+
+        /// Automatically write recognized BLE health data to HealthKit.
+        private func processHealthData(serviceUUID: String, characteristicUUID: String, data: Data) {
+            guard let dataType = GATTProfiles.identifyCharacteristic(
+                serviceUUID: serviceUUID,
+                characteristicUUID: characteristicUUID
+            ) else { return }
+
+            switch dataType {
+            case .heartRate:
+                if let reading = GATTProfiles.parseHeartRate(data: data) {
+                    healthKit.writeHeartRate(bpm: Double(reading.bpm))
+
+                    // Accumulate RR intervals for HRV
+                    rrAccumulator.append(contentsOf: reading.rrIntervals)
+                    // Write HRV every 30 seconds if we have enough data
+                    if rrAccumulator.count >= 5,
+                       Date().timeIntervalSince(lastHRVWrite) >= 30 {
+                        let mean = rrAccumulator.reduce(0, +) / Double(rrAccumulator.count)
+                        let variance = rrAccumulator.map { ($0 - mean) * ($0 - mean) }.reduce(0, +) / Double(rrAccumulator.count)
+                        let sdnn = variance.squareRoot()
+                        healthKit.writeHRV(ms: sdnn)
+                        rrAccumulator.removeAll()
+                        lastHRVWrite = Date()
+                    }
+                }
+
+            case .spo2:
+                if let spo2 = GATTProfiles.parseSpO2(data: data) {
+                    healthKit.writeSpO2(percentage: spo2)
+                }
+
+            case .temperature, .battery:
+                break // Not writing these to HealthKit yet
+            }
+        }
+    }
+}
+
+// MARK: - BLEManagerDelegate
+
+extension WhitelistedWebView.Coordinator: BLEManagerDelegate {
+    func bleManager(_ manager: BLEManager, didDiscoverDevice device: BLEDevice) {
+        let js = "window.__havenBLE.onDeviceDiscovered({id:\(escapeJS(device.id)),name:\(escapeJS(device.name ?? "Unknown")),rssi:\(device.rssi)});"
+        DispatchQueue.main.async {
+            self.webView?.evaluateJavaScript(js)
+        }
+    }
+
+    func bleManager(_ manager: BLEManager, didConnect deviceId: String, name: String?) {
+        let js = "window.__havenBLE.onConnected(\(escapeJS(deviceId)));"
+        DispatchQueue.main.async {
+            self.deviceManager.addDevice(id: deviceId, name: name ?? deviceId)
+            self.webView?.evaluateJavaScript(js)
+        }
+    }
+
+    func bleManager(_ manager: BLEManager, didDisconnect deviceId: String) {
+        let js = "window.__havenBLE.onDisconnected(\(escapeJS(deviceId)));"
+        DispatchQueue.main.async {
+            self.deviceManager.removeDevice(id: deviceId)
+            self.webView?.evaluateJavaScript(js)
+        }
+    }
+
+    func bleManager(_ manager: BLEManager, didServicesReady deviceId: String) {
+        let js = "window.__havenBLE.onServicesReady(\(escapeJS(deviceId)));"
+        DispatchQueue.main.async {
+            self.webView?.evaluateJavaScript(js)
+        }
+    }
+
+    func bleManager(_ manager: BLEManager, didReceiveData data: Data, characteristicUUID: String, deviceId: String) {
+        let bytes = Array(data)
+        let js = "window.__havenBLE.onCharacteristicValueChanged(\(escapeJS(deviceId)),\(escapeJS(characteristicUUID)),new Uint8Array([\(bytes.map(String.init).joined(separator: ","))]));"
+        DispatchQueue.main.async {
+            self.webView?.evaluateJavaScript(js)
+        }
+
+        // Auto-write to HealthKit if this is a recognized health characteristic
+        // We need the service UUID — use a best-guess based on the characteristic
+        let serviceGuess: String
+        let charUpper = characteristicUUID.uppercased()
+        if charUpper.contains("2A37") { serviceGuess = "180D" }
+        else if charUpper.contains("2A5E") { serviceGuess = "1822" }
+        else if charUpper.contains("2A1C") { serviceGuess = "1809" }
+        else if charUpper.contains("2A19") { serviceGuess = "180F" }
+        else { serviceGuess = "" }
+
+        if !serviceGuess.isEmpty {
+            processHealthData(serviceUUID: serviceGuess, characteristicUUID: characteristicUUID, data: data)
+        }
+    }
+
+    func bleManager(_ manager: BLEManager, didReadValue data: Data, characteristicUUID: String, deviceId: String) {
+        bleManager(manager, didReceiveData: data, characteristicUUID: characteristicUUID, deviceId: deviceId)
+    }
+
+    func bleManager(_ manager: BLEManager, didError error: String) {
+        let js = "window.__havenBLE.onError(\(escapeJS(error)));"
+        DispatchQueue.main.async {
+            self.webView?.evaluateJavaScript(js)
+        }
+    }
+
+    private func escapeJS(_ value: String) -> String {
+        var escaped = value
+        escaped = escaped.replacingOccurrences(of: "\\", with: "\\\\")
+        escaped = escaped.replacingOccurrences(of: "'", with: "\\'")
+        escaped = escaped.replacingOccurrences(of: "\"", with: "\\\"")
+        escaped = escaped.replacingOccurrences(of: "\n", with: "\\n")
+        escaped = escaped.replacingOccurrences(of: "\r", with: "\\r")
+        escaped = escaped.replacingOccurrences(of: "\u{2028}", with: "\\u2028")
+        escaped = escaped.replacingOccurrences(of: "\u{2029}", with: "\\u2029")
+        escaped = escaped.replacingOccurrences(of: "</", with: "<\\/")
+        return "'\(escaped)'"
     }
 }
 
@@ -186,85 +299,5 @@ class WeakScriptMessageHandler: NSObject, WKScriptMessageHandler {
         didReceive message: WKScriptMessage
     ) {
         delegate?.userContentController(userContentController, didReceive: message)
-    }
-}
-
-// MARK: - BLEManagerDelegate
-
-extension WebViewRepresentable.Coordinator: BLEManagerDelegate {
-    func bleManager(_ manager: BLEManager, didDiscoverDevice device: BLEDevice) {
-        let js = """
-        window.__havenBLE.onDeviceDiscovered({
-            id: \(escapeJS(device.id)),
-            name: \(escapeJS(device.name ?? "Unknown")),
-            rssi: \(device.rssi)
-        });
-        """
-        DispatchQueue.main.async {
-            self.webView?.evaluateJavaScript(js)
-        }
-    }
-
-    func bleManager(_ manager: BLEManager, didConnect deviceId: String, name: String?) {
-        let js = "window.__havenBLE.onConnected(\(escapeJS(deviceId)));"
-        DispatchQueue.main.async {
-            self.viewModel.addConnectedDevice(id: deviceId, name: name ?? deviceId)
-            self.webView?.evaluateJavaScript(js)
-        }
-    }
-
-    func bleManager(_ manager: BLEManager, didDisconnect deviceId: String) {
-        let js = "window.__havenBLE.onDisconnected(\(escapeJS(deviceId)));"
-        DispatchQueue.main.async {
-            self.viewModel.removeConnectedDevice(id: deviceId)
-            self.webView?.evaluateJavaScript(js)
-        }
-    }
-
-    func bleManager(_ manager: BLEManager, didServicesReady deviceId: String) {
-        let js = "window.__havenBLE.onServicesReady(\(escapeJS(deviceId)));"
-        DispatchQueue.main.async {
-            self.webView?.evaluateJavaScript(js)
-        }
-    }
-
-    func bleManager(_ manager: BLEManager, didReceiveData data: Data, characteristicUUID: String, deviceId: String) {
-        let bytes = Array(data)
-        let js = """
-        window.__havenBLE.onCharacteristicValueChanged(
-            \(escapeJS(deviceId)),
-            \(escapeJS(characteristicUUID)),
-            new Uint8Array([\(bytes.map(String.init).joined(separator: ","))])
-        );
-        """
-        DispatchQueue.main.async {
-            self.webView?.evaluateJavaScript(js)
-        }
-    }
-
-    func bleManager(_ manager: BLEManager, didReadValue data: Data, characteristicUUID: String, deviceId: String) {
-        bleManager(manager, didReceiveData: data, characteristicUUID: characteristicUUID, deviceId: deviceId)
-    }
-
-    func bleManager(_ manager: BLEManager, didError error: String) {
-        let js = "window.__havenBLE.onError(\(escapeJS(error)));"
-        DispatchQueue.main.async {
-            self.webView?.evaluateJavaScript(js)
-        }
-    }
-
-    /// Escape a string for safe interpolation into JavaScript.
-    /// Prevents XSS from malicious BLE device names or error messages.
-    private func escapeJS(_ value: String) -> String {
-        var escaped = value
-        escaped = escaped.replacingOccurrences(of: "\\", with: "\\\\")
-        escaped = escaped.replacingOccurrences(of: "'", with: "\\'")
-        escaped = escaped.replacingOccurrences(of: "\"", with: "\\\"")
-        escaped = escaped.replacingOccurrences(of: "\n", with: "\\n")
-        escaped = escaped.replacingOccurrences(of: "\r", with: "\\r")
-        escaped = escaped.replacingOccurrences(of: "\u{2028}", with: "\\u2028")
-        escaped = escaped.replacingOccurrences(of: "\u{2029}", with: "\\u2029")
-        escaped = escaped.replacingOccurrences(of: "</", with: "<\\/")
-        return "'\(escaped)'"
     }
 }
